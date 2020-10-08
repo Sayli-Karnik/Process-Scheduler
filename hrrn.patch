@@ -1,0 +1,732 @@
+diff --git a/arch/x86/Kconfig b/arch/x86/Kconfig
+index 887d3a7..b88e388 100644
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -2937,6 +2937,12 @@ config X86_DMA_REMAP
+ config HAVE_GENERIC_GUP
+ 	def_bool y
+ 
++menu "HRRN schduler"
++config SCHED_HRRN_POLICY
++	bool "enable HRRN scheduler"
++	default y
++endmenu
++
+ source "net/Kconfig"
+ 
+ source "drivers/Kconfig"
+diff --git a/fs/proc/Makefile b/fs/proc/Makefile
+index ead487e..39a4f9c 100644
+--- a/fs/proc/Makefile
++++ b/fs/proc/Makefile
+@@ -27,6 +27,7 @@ proc-y	+= softirqs.o
+ proc-y	+= namespaces.o
+ proc-y	+= self.o
+ proc-y	+= thread_self.o
++proc-$(CONFIG_SCHED_HRRN_POLICY)	+= proc_hrrn.o
+ proc-$(CONFIG_PROC_SYSCTL)	+= proc_sysctl.o
+ proc-$(CONFIG_NET)		+= proc_net.o
+ proc-$(CONFIG_PROC_KCORE)	+= kcore.o
+diff --git a/fs/proc/proc_hrrn.c b/fs/proc/proc_hrrn.c
+new file mode 100644
+index 0000000..c123b6a
+--- /dev/null
++++ b/fs/proc/proc_hrrn.c
+@@ -0,0 +1,112 @@
++/*
++ *  linux/fs/proc/proc_hrrn.c
++ *
++ *  linux/fs/proc/array.c
++ *  Copyright (C) 1992  by Linus Torvalds
++ *  based on ideas by Darren Senn
++ *
++ *  This used to be the part of array.c. See the rest of history and credits
++ *  there. I took this into a separate file and switched the thing to generic
++ *  proc_file_inode_operations, leaving in array.c only per-process stuff.
++ *  Inumbers allocation made dynamic (via create_proc_entry()).  AV, May 1999.
++ *
++ * Changes:
++ * Fulton Green      :  Encapsulated position metric calculations.
++ *                      <kernel@FultonGreen.com>
++ *
++ */
++
++#include <linux/types.h>
++#include <linux/errno.h>
++#include <linux/time.h>
++#include <linux/kernel.h>
++#include <linux/kernel_stat.h>
++#include <linux/fs.h>
++#include <linux/tty.h>
++#include <linux/string.h>
++#include <linux/mman.h>
++#include <linux/proc_fs.h>
++#include <linux/ioport.h>
++#include <linux/mm.h>
++#include <linux/mmzone.h>
++#include <linux/pagemap.h>
++#include <linux/swap.h>
++#include <linux/slab.h>
++#include <linux/smp.h>
++#include <linux/signal.h>
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/seq_file.h>
++#include <linux/times.h>
++#include <linux/profile.h>
++#include <linux/utsname.h>
++#include <linux/blkdev.h>
++#include <linux/hugetlb.h>
++#include <linux/jiffies.h>
++#include <linux/sysrq.h>
++#include <linux/vmalloc.h>
++#include <linux/crash_dump.h>
++#include <linux/pid_namespace.h>
++#include <asm/uaccess.h>
++#include <asm/pgtable.h>
++#include <asm/io.h>
++#include <asm/tlb.h>
++#include <asm/div64.h>
++#include "internal.h"
++#include "../../kernel/sched/sched.h"
++
++#ifdef  CONFIG_SCHED_HRRN_POLICY
++#define HRRN_MAX_CURSOR_LINES_EVENTS   1
++
++static int hrrn_open(struct inode *inode, struct file *file)
++{
++        return 0;
++}
++
++
++static ssize_t hrrn_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos)
++{
++        char buffer[HRRN_MSG_SIZE];
++        unsigned int len=0,k,i;
++        struct hrrn_event_log *log=NULL;
++        buffer[0]='\0';
++        log=get_hrrn_event_log();
++        if(log){
++                if(log->cursor < log->lines){
++                        k=(log->lines > (log->cursor + HRRN_MAX_CURSOR_LINES_EVENTS))?(log->cursor + HRRN_MAX_CURSOR_LINES_EVENTS):(log->lines);
++                        for(i=log->cursor; i<k;i++){
++                                len = snprintf(buffer, count, "%s%c,%llu.%09llu,%s\n",
++                                        buffer,
++                                        HRRN_EVENT_CODE(log->hrrn_event[i].action),
++                                        log->hrrn_event[i].timestamp / (1000 * 1000 * 1000), /* time / ns */
++                                        log->hrrn_event[i].timestamp % (1000 * 1000 * 1000), /* time % ns */
++                                        log->hrrn_event[i].msg);
++                        }
++                        log->cursor=k;
++                }
++                if(len) 
++                        copy_to_user(buf,buffer,len);
++
++        }
++        return len;
++}
++
++static int hrrn_release(struct inode *inode, struct file *file)
++{
++        return 0;
++}
++
++static const struct file_operations proc_hrrn_operations = {
++        .open           = hrrn_open,
++        .read           = hrrn_read,
++        .release        = hrrn_release,
++};
++
++int __init proc_hrrn_init(void)
++{
++	proc_create("hrrn_event", 0, NULL, &proc_hrrn_operations);
++        return 0;
++}
++module_init(proc_hrrn_init);
++#endif
++
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 43731fe..808a764 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -498,6 +498,18 @@ struct sched_rt_entity {
+ #endif
+ } __randomize_layout;
+ 
++
++#ifdef	CONFIG_SCHED_HRRN_POLICY
++struct sched_hrrn_entity {
++	unsigned int hrrn_id;
++	unsigned long long rel_response_rate;
++	unsigned long long absolute_response_rate;
++
++	struct rb_node hrrn_rb_node;
++	struct list_head hrrn_list_node;
++};
++#endif	/* CONFIG_SCHED_HRRN_POLICY */
++
+ struct sched_dl_entity {
+ 	struct rb_node			rb_node;
+ 
+@@ -644,6 +656,10 @@ struct task_struct {
+ 	const struct sched_class	*sched_class;
+ 	struct sched_entity		se;
+ 	struct sched_rt_entity		rt;
++#ifdef CONFIG_SCHED_HRRN_POLICY
++	struct sched_hrrn_entity	hrrn;
++#endif
++
+ #ifdef CONFIG_CGROUP_SCHED
+ 	struct task_group		*sched_task_group;
+ #endif
+diff --git a/include/uapi/linux/sched.h b/include/uapi/linux/sched.h
+index 22627f8..d9f918c 100644
+--- a/include/uapi/linux/sched.h
++++ b/include/uapi/linux/sched.h
+@@ -41,6 +41,8 @@
+ #define SCHED_IDLE		5
+ #define SCHED_DEADLINE		6
+ 
++#define SCHED_HRRN		9
++
+ /* Can be ORed in to make sure the process is reverted back to SCHED_NORMAL on fork */
+ #define SCHED_RESET_ON_FORK     0x40000000
+ 
+diff --git a/include/uapi/linux/sched/types.h b/include/uapi/linux/sched/types.h
+index 10fbb80..fe4a636 100644
+--- a/include/uapi/linux/sched/types.h
++++ b/include/uapi/linux/sched/types.h
+@@ -70,6 +70,10 @@ struct sched_attr {
+ 	__u64 sched_runtime;
+ 	__u64 sched_deadline;
+ 	__u64 sched_period;
++
++	/* SCHED_HRRN */
++	unsigned long long hrrn_response_rate;
++	__u64 hrrn_id;
+ };
+ 
+ #endif /* _UAPI_LINUX_SCHED_TYPES_H */
+diff --git a/kernel/sched/Makefile b/kernel/sched/Makefile
+index d9a02b3..23fe937 100644
+--- a/kernel/sched/Makefile
++++ b/kernel/sched/Makefile
+@@ -18,6 +18,7 @@ endif
+ 
+ obj-y += core.o loadavg.o clock.o cputime.o
+ obj-y += idle.o fair.o rt.o deadline.o
++obj-y += sched_hrrn.o
+ obj-y += wait.o wait_bit.o swait.o completion.o
+ 
+ obj-$(CONFIG_SMP) += cpupri.o cpudeadline.o topology.o stop_task.o
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index fe365c9..6d18909 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -3416,6 +3416,12 @@ static void __sched notrace __schedule(bool preempt)
+ 	struct rq *rq;
+ 	int cpu;
+ 
++#ifdef  CONFIG_SCHED_HRRN_POLICY
++/* Buffer for hrrn to spritnf messages for event log */
++        char msg[HRRN_MSG_SIZE];
++#endif
++
++
+ 	cpu = smp_processor_id();
+ 	rq = cpu_rq(cpu);
+ 	prev = rq->curr;
+@@ -3476,6 +3482,20 @@ static void __sched notrace __schedule(bool preempt)
+ 	clear_tsk_need_resched(prev);
+ 	clear_preempt_need_resched();
+ 
++#ifdef  CONFIG_SCHED_HRRN_POLICY
++/* If either task involved in schedule() is a hrrn task, log context_switch */
++        if(prev->policy==SCHED_HRRN || next->policy==SCHED_HRRN){
++		int prev_cid = prev->policy==SCHED_HRRN?prev->hrrn.hrrn_id:-1;
++		int next_cid = next->policy==SCHED_HRRN?next->hrrn.hrrn_id:-1;
++
++		snprintf(msg,HRRN_MSG_SIZE,"prev->(cid%d:pid%d),next->(cid%d:pid%d)",
++				prev_cid,prev->pid,next_cid,next->pid);
++                register_hrrn_event(sched_clock(), msg, HRRN_CONTEXT_SWITCH);
++
++
++        }
++#endif
++
+ 	if (likely(prev != next)) {
+ 		rq->nr_switches++;
+ 		rq->curr = next;
+@@ -4087,7 +4107,11 @@ static void __setscheduler_params(struct task_struct *p,
+ 
+ 	p->policy = policy;
+ 
+-	if (dl_policy(policy))
++	if (policy == SCHED_HRRN) {
++		p->hrrn.hrrn_id = attr->hrrn_id;
++		p->hrrn.rel_response_rate = attr->hrrn_response_rate;
++		/* Don't initialize list or rb tree node */
++	} else if (dl_policy(policy))
+ 		__setparam_dl(p, attr);
+ 	else if (fair_policy(policy))
+ 		p->static_prio = NICE_TO_PRIO(attr->sched_nice);
+@@ -4116,7 +4140,9 @@ static void __setscheduler(struct rq *rq, struct task_struct *p,
+ 	if (keep_boost)
+ 		p->prio = rt_effective_prio(p, p->prio);
+ 
+-	if (dl_prio(p->prio))
++	if (p->policy == SCHED_HRRN) /* Normally scheduler determined by prio, hrrn is exception*/
++		p->sched_class = &hrrn_sched_class;
++	else if (dl_prio(p->prio))
+ 		p->sched_class = &dl_sched_class;
+ 	else if (rt_prio(p->prio))
+ 		p->sched_class = &rt_sched_class;
+@@ -6024,6 +6050,11 @@ void __init sched_init(void)
+ 		init_cfs_rq(&rq->cfs);
+ 		init_rt_rq(&rq->rt);
+ 		init_dl_rq(&rq->dl);
++
++#ifdef CONFIG_SCHED_HRRN_POLICY
++		init_hrrn_rq(&rq->hrrn);
++#endif /* CONFIG_SCHED_HRRN_POLICY */
++
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+ 		root_task_group.shares = ROOT_TASK_GROUP_LOAD;
+ 		INIT_LIST_HEAD(&rq->leaf_cfs_rq_list);
+@@ -6112,6 +6143,10 @@ void __init sched_init(void)
+ 
+ 	init_schedstats();
+ 
++#ifdef CONFIG_SCHED_HRRN_POLICY
++	init_hrrn_event_log();
++#endif /* CONFIG_SCHED_HRRN_POLICY */
++
+ 	scheduler_running = 1;
+ }
+ 
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index c7742dc..4174c48 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -173,7 +173,7 @@ static inline int dl_policy(int policy)
+ static inline bool valid_policy(int policy)
+ {
+ 	return idle_policy(policy) || fair_policy(policy) ||
+-		rt_policy(policy) || dl_policy(policy);
++		rt_policy(policy) || dl_policy(policy) || policy == SCHED_HRRN;
+ }
+ 
+ static inline int task_has_rt_policy(struct task_struct *p)
+@@ -730,6 +730,16 @@ struct root_domain {
+ 	unsigned long		max_cpu_capacity;
+ };
+ 
++
++
++#ifdef CONFIG_SCHED_HRRN_POLICY
++struct hrrn_rq {
++	struct rb_root hrrn_rb_root;
++	struct list_head hrrn_list_head;
++	atomic_t nr_running;
++};
++#endif /* CONFIG_SCHED_HRRN_POLICY */
++
+ extern struct root_domain def_root_domain;
+ extern struct mutex sched_domains_mutex;
+ 
+@@ -785,6 +795,10 @@ struct rq {
+ 	struct rt_rq		rt;
+ 	struct dl_rq		dl;
+ 
++#ifdef CONFIG_SCHED_HRRN_POLICY
++	struct hrrn_rq		hrrn;
++#endif /* CONFIG_SCHED_HRRN_POLICY */
++
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+ 	/* list of leaf cfs_rq on this CPU: */
+ 	struct list_head	leaf_cfs_rq_list;
+@@ -1547,11 +1561,7 @@ static inline void set_curr_task(struct rq *rq, struct task_struct *curr)
+ 	curr->sched_class->set_curr_task(rq);
+ }
+ 
+-#ifdef CONFIG_SMP
+-#define sched_class_highest (&stop_sched_class)
+-#else
+-#define sched_class_highest (&dl_sched_class)
+-#endif
++#define sched_class_highest (&hrrn_sched_class)
+ #define for_each_class(class) \
+    for (class = sched_class_highest; class; class = class->next)
+ 
+@@ -1561,6 +1571,10 @@ extern const struct sched_class rt_sched_class;
+ extern const struct sched_class fair_sched_class;
+ extern const struct sched_class idle_sched_class;
+ 
++#ifdef CONFIG_SCHED_HRRN_POLICY
++extern const struct sched_class hrrn_sched_class;
++#endif /* CONFIG_SCHED_HRRN_POLICY */
++
+ 
+ #ifdef CONFIG_SMP
+ 
+@@ -2053,6 +2067,9 @@ print_numa_stats(struct seq_file *m, int node, unsigned long tsf,
+ extern void init_cfs_rq(struct cfs_rq *cfs_rq);
+ extern void init_rt_rq(struct rt_rq *rt_rq);
+ extern void init_dl_rq(struct dl_rq *dl_rq);
++#ifdef CONFIG_SCHED_HRRN_POLICY
++extern void init_hrrn_rq(struct hrrn_rq *hrrn_rq);
++#endif /* CONFIG_SCHED_HRRN_POLICY */
+ 
+ extern void cfs_bandwidth_usage_inc(void);
+ extern void cfs_bandwidth_usage_dec(void);
+@@ -2194,3 +2211,36 @@ static inline unsigned long cpu_util_cfs(struct rq *rq)
+ 	return util;
+ }
+ #endif
++
++
++
++#ifdef	CONFIG_SCHED_HRRN_POLICY
++
++/* Rolls its own logging system for events related to HRRN */
++#define HRRN_MSG_SIZE		400
++#define HRRN_MAX_EVENT_LINES	10000
++
++#define HRRN_ENQUEUE		1
++#define HRRN_DEQUEUE		2
++#define	HRRN_CONTEXT_SWITCH	3
++#define	HRRN_MSG		4
++
++#define HRRN_EVENT_CODE(i) ("?EDSM?????"[i])
++
++struct hrrn_event{
++	int action;
++	unsigned long long timestamp;
++	char msg[HRRN_MSG_SIZE];
++};
++
++struct hrrn_event_log{
++	struct hrrn_event hrrn_event[HRRN_MAX_EVENT_LINES];
++	unsigned long lines;
++	unsigned long cursor;
++};
++
++void init_hrrn_event_log(void);
++struct hrrn_event_log * get_hrrn_event_log(void);
++void register_hrrn_event(unsigned long long t, char *m, int a);
++
++#endif
+diff --git a/kernel/sched/sched_hrrn.c b/kernel/sched/sched_hrrn.c
+new file mode 100644
+index 0000000..b474edb
+--- /dev/null
++++ b/kernel/sched/sched_hrrn.c
+@@ -0,0 +1,308 @@
++#include "sched.h"
++
++
++/*
++ * hrrn-task scheduling class.
++ *
++ *
++ */
++
++/* =========================================================================
++ *                       Log Functions Implementation
++ */
++
++struct hrrn_event_log hrrn_event_log;
++
++struct hrrn_event_log * get_hrrn_event_log(void)
++{
++	return &hrrn_event_log;
++}
++void init_hrrn_event_log(void)
++{
++	char msg[HRRN_MSG_SIZE];
++	hrrn_event_log.lines=hrrn_event_log.cursor=0;
++	snprintf(msg,HRRN_MSG_SIZE,"init_hrrn_event_log:(%lu:%lu)", hrrn_event_log.lines, hrrn_event_log.cursor);
++	register_hrrn_event(sched_clock(), msg, HRRN_MSG);
++
++}
++/* Logs an event if there's room */
++void register_hrrn_event(unsigned long long t, char *m, int a)
++{
++
++	if(hrrn_event_log.lines < HRRN_MAX_EVENT_LINES){
++		hrrn_event_log.hrrn_event[hrrn_event_log.lines].action=a;
++		hrrn_event_log.hrrn_event[hrrn_event_log.lines].timestamp=t;
++		strncpy(hrrn_event_log.hrrn_event[hrrn_event_log.lines].msg,m,HRRN_MSG_SIZE-1);
++		hrrn_event_log.lines++;
++		
++		printk(KERN_ALERT "HRRN event: %s\n", m);
++	}
++	else{
++		printk(KERN_ALERT "ERROR register_hrrn_event full\n");
++	}
++
++}
++
++
++/* =========================================================================
++ *             Funcs for hrrn tasks, and lists
++ */ 
++
++void init_hrrn_rq(struct hrrn_rq *hrrn_rq)
++{
++	hrrn_rq->hrrn_rb_root=RB_ROOT;
++	INIT_LIST_HEAD(&hrrn_rq->hrrn_list_head);
++	atomic_set(&hrrn_rq->nr_running,0);
++}
++
++/* =========================================================================
++ *                       rb_trees of hrrn_tasks
++ */ 
++
++void remove_hrrn_task_rb_tree(struct hrrn_rq *rq, struct sched_hrrn_entity *p)
++{
++	rb_erase(&(p->hrrn_rb_node),&(rq->hrrn_rb_root));
++	p->hrrn_rb_node.rb_left=p->hrrn_rb_node.rb_right=NULL;
++}
++
++void insert_hrrn_task_rb_tree(struct hrrn_rq *rq, struct sched_hrrn_entity *p)
++{
++	struct rb_node **node=NULL;
++	struct rb_node *parent=NULL;
++	struct sched_hrrn_entity *entry=NULL;
++	node=&rq->hrrn_rb_root.rb_node;
++	while(*node!=NULL){
++		parent=*node;
++		entry=rb_entry(parent, struct sched_hrrn_entity,hrrn_rb_node);
++		if(entry){
++			if(p->absolute_response_rate > entry->absolute_response_rate){
++				node=&parent->rb_left;
++			}else{
++				node=&parent->rb_right;
++			}
++		}
++	}
++	rb_link_node(&p->hrrn_rb_node,parent,node);
++	rb_insert_color(&p->hrrn_rb_node,&rq->hrrn_rb_root);
++}
++struct sched_hrrn_entity * highest_response_rate_hrrn_task_rb_tree(struct hrrn_rq *rq)
++{
++	struct rb_node *node=NULL;
++	struct sched_hrrn_entity *p=NULL;
++	node=rq->hrrn_rb_root.rb_node;
++	if(node==NULL)
++		return NULL;
++
++	while(node->rb_left!=NULL){
++		node=node->rb_left;
++	}
++	p=rb_entry(node, struct sched_hrrn_entity,hrrn_rb_node);
++	return p;
++}
++
++/* If curr task is priority < HRRN, or some other task has an earlier deadline, preempt */
++static void check_preempt_curr_hrrn(struct rq *rq, struct task_struct *p, int flags)
++{
++
++	printk(KERN_ALERT "hrrn: check_preempt_currl\n");
++}
++
++/* =========================================================================
++ *                  Implementation of Scheduler class functions
++ */
++
++/* Returns next task struct to be scheduled (Highest HRRN task) */
++static struct task_struct *pick_next_task_hrrn(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
++{
++	//printk(KERN_ALERT "hrrn: pick_next_task\n");
++	
++	struct sched_hrrn_entity *ce=NULL;
++	struct task_struct *p=NULL;
++	ce = highest_response_rate_hrrn_task_rb_tree(&rq->hrrn);
++	if(ce){
++		p = container_of(ce, struct task_struct, hrrn);
++		printk(KERN_ALERT "hrrn: pick_next_task: picked cid %d\n", ce->hrrn_id );
++		return p;
++	}
++	
++	return NULL;
++}
++
++
++/* Called when hrrn task becomes runnable */
++/* Finds corresponding hrrn_task in the given rq */
++static void enqueue_task_hrrn(struct rq *rq, struct task_struct *p, int flags)
++{
++	struct sched_hrrn_entity *ce;
++	char msg[HRRN_MSG_SIZE];
++
++	if(p){
++		ce=&(p->hrrn);
++
++//		ce->absolute_response_rate = sched_clock() + ce->rel_response_rate;
++		ce->absolute_response_rate =  ce->rel_response_rate;
++
++		insert_hrrn_task_rb_tree(&rq->hrrn, ce);
++		atomic_inc(&rq->hrrn.nr_running);
++		snprintf(msg,HRRN_MSG_SIZE,"Task Enqueued! cid %d",ce->hrrn_id);
++		register_hrrn_event(sched_clock(), msg, HRRN_ENQUEUE);
++	}
++}
++
++/* Called when hrrn task unrunnable */
++/* Finds which rq's hrrn list it's in */
++/* Removes it from rb tree */
++/* If task exited, destroy the hrrn_task */
++static void dequeue_task_hrrn(struct rq *rq, struct task_struct *p, int sleep)
++{
++	struct sched_hrrn_entity *ce;
++	char msg[HRRN_MSG_SIZE];
++	if(p){
++		ce = &(p->hrrn);
++		
++		if(1){
++			snprintf(msg,HRRN_MSG_SIZE,"Task Dequeued! cid %d",ce->hrrn_id);
++			register_hrrn_event(sched_clock(), msg, HRRN_DEQUEUE);
++
++			remove_hrrn_task_rb_tree(&rq->hrrn, ce);
++
++			atomic_dec(&rq->hrrn.nr_running);
++
++		}
++		else{
++			printk(KERN_ALERT "error in dequeue_task_hrrn\n");
++		}
++	}
++
++}
++
++static void put_prev_task_hrrn(struct rq *rq, struct task_struct *prev) { }
++
++static void task_tick_hrrn(struct rq *rq, struct task_struct *p, int queued)
++{
++	printk(KERN_ALERT "hrrn: task_tick cid%d, pid%d\n", p->hrrn.hrrn_id, p->pid);
++	//check_preempt_curr_hrrn(rq, p);
++}
++
++static void set_curr_task_hrrn(struct rq *rq) { }
++
++
++/*
++ * When switching a task to RT, we may overload the runqueue
++ * with RT tasks. In this case we try to push them off to
++ * other runqueues.
++ */
++static void switched_to_hrrn(struct rq *rq, struct task_struct *p)
++{
++	printk(KERN_ALERT "hrrn: switched_to\n");
++        /*
++         * If we are already running, then there's nothing
++         * that needs to be done. But if we are not running
++         * we may need to preempt the current running task.
++         * If that current running task is also an RT task
++         * then see if we can move to another run queue.
++         */
++}
++
++
++unsigned int get_rr_interval_hrrn(struct rq *rq, struct task_struct *task)
++{
++	printk(KERN_ALERT "hrrn: get_rr_interval\n");
++	return 0;
++}
++
++static void yield_task_hrrn(struct rq *rq) { 
++	printk(KERN_ALERT "hrrn: yield_task\n");
++}
++
++
++/*
++ * Priority of the task has changed. This may cause
++ * us to initiate a push or pull.
++ */
++static void prio_changed_hrrn(struct rq *rq, struct task_struct *p, int oldprio) { 
++	printk(KERN_ALERT "hrrn: prio_changed\n");
++}
++
++static int select_task_rq_hrrn(struct task_struct *task, int task_cpu, int sd_flag, int flags)
++{
++	printk(KERN_ALERT "hrrn: select_task_rq\n");
++//	struct rq *rq = task_rq(p);
++
++	if (sd_flag != SD_BALANCE_WAKE)
++		return smp_processor_id();
++
++	return task_cpu;
++}
++
++
++static void set_cpus_allowed_hrrn(struct task_struct *p, const struct cpumask *new_mask) { }
++
++/* Assumes rq->lock is held */
++static void rq_online_hrrn(struct rq *rq) { }
++/* Assumes rq->lock is held */
++static void rq_offline_hrrn(struct rq *rq) { }
++
++// OLD static void pre_schedule_hrrn(struct rq *rq, struct task_struct *prev) { } 
++// OLD static void post_schedule_hrrn(struct rq *rq) { }
++//
++/*
++ * If we are not running and we are not going to reschedule soon, we should
++ * try to push tasks away now
++ */
++static void task_woken_hrrn(struct rq *rq, struct task_struct *p)
++{
++	printk(KERN_ALERT "hrrn: task_woken\n");
++}
++
++/*
++ * When switch from the rt queue, we bring ourselves to a position
++ * that we might want to pull RT tasks from other runqueues.
++ */
++static void switched_from_hrrn(struct rq *rq, struct task_struct *p) { }
++
++/*
++ * Simple, special scheduling class for the per-CPU hrrn tasks:
++ */
++const struct sched_class hrrn_sched_class = {
++/* old sched_class_highest was set to these in kernel/sched/sched.h */
++#ifdef CONFIG_SMP
++	.next 			= &stop_sched_class,
++#else
++	.next 			= &dl_sched_class,
++#endif
++	.enqueue_task		= enqueue_task_hrrn,
++	.dequeue_task		= dequeue_task_hrrn,
++
++	.yield_task		= yield_task_hrrn,
++	.check_preempt_curr	= check_preempt_curr_hrrn,
++
++	.pick_next_task		= pick_next_task_hrrn,
++	.put_prev_task		= put_prev_task_hrrn,
++
++#ifdef CONFIG_SMP
++	// OLD .load_balance		= load_balance_hrrn,
++	// OLD .move_one_task		= move_one_task_hrrn,
++
++	.select_task_rq		= select_task_rq_hrrn,
++	
++	.task_woken		= task_woken_hrrn,
++	.set_cpus_allowed       = set_cpus_allowed_hrrn,
++
++	.rq_online              = rq_online_hrrn,
++	.rq_offline             = rq_offline_hrrn,
++	
++	// OLD .pre_schedule		= pre_schedule_hrrn,
++	// OLD .post_schedule		= post_schedule_hrrn,
++#endif
++
++	.set_curr_task          = set_curr_task_hrrn,
++	.task_tick		= task_tick_hrrn,
++
++	.switched_from		= switched_from_hrrn,
++	.switched_to		= switched_to_hrrn,
++	.prio_changed		= prio_changed_hrrn,
++
++	.get_rr_interval	= get_rr_interval_hrrn,
++
++};
